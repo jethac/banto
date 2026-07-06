@@ -17,6 +17,7 @@ banto is the minimum viable answer:
   - **The politeness guard**: profiles marked `"gpu": true` are refused with `409` when GPU utilization or VRAM crosses a threshold — because the human playing a game on that GPU outranks your agent. Configurable (`gpu_busy_util_pct`, `gpu_busy_vram_pct`).
   - Optional self-registration into whatever fleet ledger you run (`registry_cmd` — a shell hook fired on up/serve/stop).
   - Optional shared-token auth (`X-Banto-Token`).
+- **Capability API** — the fleet-dispatch decision input: `GET /capability` reports the box's real envelope (unified RAM or VRAM, usable fraction, live free memory, estimated memory bandwidth, detected engines), and `POST /fit {"params_b": 120, "active_params_b": 12, "quant_bits": 4, "context": 32768, "kv_bits": 8}` answers *"can this model even fit here, and roughly how fast is batch-1 decode?"* — weights + KV-cache + overhead vs. the envelope, with a bandwidth-roofline tok/s estimate. Labeled estimates, not benchmarks: they tell an orchestrator where **not** to bother.
 - **`banto_lb.py`** — a dumb-simple failover proxy for OpenAI-compatible servers: ordered backends per listener, first healthy backend wins per connection, raw byte splice so SSE/streaming/websockets pass through untouched. All backends down → fail closed.
 
 No database. No queue. No sidecar. Two files.

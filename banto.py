@@ -8,6 +8,12 @@ things up and down on request. Orchestrators ask; banto accepts or refuses.
 HTTP API (default :7777):
   GET  /health          host, OS, GPU utilization/VRAM, busy verdict, running profiles
   GET  /gpu             raw GPU snapshot
+  GET  /capability      what this box can run: memory envelope (unified or VRAM),
+                        est. memory bandwidth, live free memory, available engines
+  POST /fit             {"params_b": 120, "active_params_b": 12, "quant_bits": 4,
+                         "context": 32768, "kv_bits": 8}
+                        -> fits? headroom? rough batch-1 decode tok/s (roofline:
+                        bandwidth / active weight bytes). Estimates, clearly labeled.
   GET  /profiles        configured profiles
   POST /serve           {"profile": "name"}  -> 200 started | 208 already | 409 refused
   POST /stop            {"profile": "name"}  -> 200 stopped | 404
@@ -36,7 +42,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 def load_json(path: Path, default):
@@ -97,6 +103,148 @@ def gpu_busy() -> tuple[bool, str]:
         if g["vram_pct"] >= BUSY_VRAM:
             return True, f"{g['name']} VRAM {g['vram_pct']:.0f}% used (threshold {BUSY_VRAM:.0f}%)"
     return False, ""
+
+
+# ---------------------------------------------------------------- capability
+# Rough sequential-read bandwidth by accelerator, GB/s. The dominant term for
+# batch-1 decode speed. Override with "bandwidth_gbps" in config.json.
+BANDWIDTH_TABLE = [
+    ("GB10", 273), ("GB200", 8000), ("B200", 8000),
+    ("RTX 5090", 1792), ("RTX 5080", 960), ("RTX 5070 Ti", 896),
+    ("RTX 5060 Ti", 448), ("RTX 5060", 448),
+    ("RTX 4090", 1008), ("RTX 4080", 717), ("RTX 4070", 504), ("RTX 4060", 272),
+    ("RTX 3090", 936), ("RTX 3080", 760), ("RTX 3060", 360),
+    ("Apple M4 Max", 546), ("Apple M4 Pro", 273), ("Apple M4", 120),
+    ("Apple M3 Max", 400), ("Apple M3 Pro", 150), ("Apple M3", 100),
+    ("Apple M2 Ultra", 800), ("Apple M2 Max", 400), ("Apple M2 Pro", 200), ("Apple M2", 100),
+    ("Apple M1 Ultra", 800), ("Apple M1 Max", 400), ("Apple M1 Pro", 200), ("Apple M1", 68),
+]
+
+
+def _mac_chip() -> str:
+    try:
+        return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _mem_bytes() -> tuple[int, int]:
+    """(total, free-ish) system RAM in bytes, best effort per platform."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                       capture_output=True, text=True, timeout=3).stdout)
+            vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3).stdout
+            page = 16384 if "page size of 16384" in vm else 4096
+            counts = {}
+            for line in vm.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    try:
+                        counts[k.strip()] = int(v.strip().rstrip("."))
+                    except ValueError:
+                        continue  # header line: "(page size of N bytes)"
+            free = (counts.get("Pages free", 0) + counts.get("Pages inactive", 0)
+                    + counts.get("Pages purgeable", 0)) * page
+            return total, free
+        if system == "Linux":
+            info = Path("/proc/meminfo").read_text()
+            kv = {l.split(":")[0]: int(l.split()[1]) for l in info.splitlines() if ":" in l}
+            return kv.get("MemTotal", 0) * 1024, kv.get("MemAvailable", 0) * 1024
+        if system == "Windows":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_OperatingSystem | "
+                 "Select-Object TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json)"],
+                capture_output=True, text=True, timeout=10).stdout
+            d = json.loads(out)
+            return int(d["TotalVisibleMemorySize"]) * 1024, int(d["FreePhysicalMemory"]) * 1024
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _bandwidth(accel_name: str) -> float:
+    if CFG.get("bandwidth_gbps"):
+        return float(CFG["bandwidth_gbps"])
+    for key, bw in BANDWIDTH_TABLE:
+        if key.lower() in accel_name.lower():
+            return float(bw)
+    return 0.0
+
+
+def capability() -> dict:
+    gpus = gpu_snapshot()
+    total_ram, free_ram = _mem_bytes()
+    if gpus:  # discrete NVIDIA: the envelope is VRAM
+        g = gpus[0]
+        envelope_gb = g["vram_total_mb"] / 1024
+        free_gb = (g["vram_total_mb"] - g["vram_used_mb"]) / 1024
+        accel, unified = g["name"], False
+    else:
+        chip = _mac_chip() if platform.system() == "Darwin" else platform.processor() or platform.machine()
+        accel, unified = chip, platform.system() == "Darwin"
+        envelope_gb = total_ram / 1e9
+        free_gb = free_ram / 1e9
+    usable_frac = float(CFG.get("usable_fraction", 0.75 if unified else 0.85))
+    engines = [e for e in ("docker", "vllm", "llama-server", "ollama", "lms")
+               if shutil.which(e)]
+    for name, url in (CFG.get("engine_probes") or {}).items():
+        if health_ok(url, 1.0):
+            engines.append(name)
+    return {
+        "host": platform.node(), "os": platform.system(),
+        "accelerator": accel, "unified_memory": unified,
+        "envelope_gb": round(envelope_gb, 1), "free_gb": round(free_gb, 1),
+        "usable_gb": round(envelope_gb * usable_frac, 1),
+        "system_ram_total_gb": round(total_ram / 1e9, 1),
+        "bandwidth_gbps_est": _bandwidth(accel),
+        "engines": engines,
+        "note": "estimates; bandwidth from a lookup table unless overridden in config",
+    }
+
+
+def fit(req: dict) -> dict:
+    """Can a model fit here, and roughly how fast is batch-1 decode?
+
+    weight bytes = params * quant_bits/8 ; KV estimate = 16MB per 1B params per
+    1k tokens at fp16 (matches ~8B/GQA models), scaled by kv_bits/16. Decode
+    tok/s roofline = bandwidth / bytes touched per token (active params for MoE).
+    """
+    cap = capability()
+    params_b = float(req.get("params_b", 0))
+    if params_b <= 0:
+        return {"error": "params_b required (billions of parameters)"}
+    active_b = float(req.get("active_params_b", params_b))
+    qbits = float(req.get("quant_bits", 4))
+    kvbits = float(req.get("kv_bits", 16))
+    context = float(req.get("context", 8192))
+    weight_gb = params_b * qbits / 8
+    kv_gb = params_b * 0.016 * (context / 1000.0) * (kvbits / 16.0)
+    if req.get("kv_gb_override") is not None:
+        kv_gb = float(req["kv_gb_override"])
+    overhead_gb = float(req.get("overhead_gb", 1.5))
+    total_gb = weight_gb + kv_gb + overhead_gb
+    usable = cap["usable_gb"]
+    headroom = usable - total_gb
+    bw = cap["bandwidth_gbps_est"]
+    active_gb = active_b * qbits / 8
+    tps = round(bw / active_gb, 1) if bw and active_gb else None
+    verdict = ("no" if headroom < 0 else
+               "tight" if headroom < 0.15 * usable else "comfortable")
+    return {
+        "verdict": verdict, "fits": headroom >= 0,
+        "weight_gb": round(weight_gb, 1), "kv_cache_gb": round(kv_gb, 1),
+        "overhead_gb": overhead_gb, "total_needed_gb": round(total_gb, 1),
+        "usable_gb": usable, "headroom_gb": round(headroom, 1),
+        "est_decode_tok_s": tps,
+        "assumptions": f"{params_b:g}B params @ {qbits:g}-bit"
+                       + (f" ({active_b:g}B active/MoE)" if active_b != params_b else "")
+                       + f", {context:g} ctx @ kv{kvbits:g}; roofline bw {bw} GB/s",
+        "note": "estimate — validate with a real load before trusting in anger",
+    }
 
 
 # ---------------------------------------------------------------- processes
@@ -217,6 +365,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif self.path == "/gpu":
             self._send(200, {"gpus": gpu_snapshot()})
+        elif self.path == "/capability":
+            self._send(200, capability())
         elif self.path == "/profiles":
             self._send(200, {n: {k: v for k, v in p.items() if k != "stop"}
                              for n, p in profiles().items()})
@@ -231,6 +381,8 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(length) or b"{}")
         except json.JSONDecodeError:
             return self._send(400, {"error": "bad json"})
+        if self.path == "/fit":
+            return self._send(200, fit(req))
         name = req.get("profile", "")
         if self.path == "/serve":
             self._send(*start_profile(name))
