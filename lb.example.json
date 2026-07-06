@@ -1,0 +1,13 @@
+{
+  "bind": "127.0.0.1",
+  "health_cache_s": 5,
+  "listeners": [
+    {
+      "listen": 8010,
+      "backends": [
+        {"host": "bigbox.example.ts.net", "port": 8001, "health": "http://bigbox.example.ts.net:8001/v1/models"},
+        {"host": "gamingpc.example.ts.net", "port": 8801, "health": "http://gamingpc.example.ts.net:8801/v1/models"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=banto compute steward
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/banto/banto.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

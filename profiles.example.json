@@ -1,0 +1,15 @@
+{
+  "voice-reflex": {
+    "start": ["llama-server", "--model", "gemma-4-e2b-q4.gguf", "--port", "8801", "-ngl", "99"],
+    "port": 8801,
+    "health_url": "http://127.0.0.1:8801/v1/models",
+    "gpu": true
+  },
+  "voice-oracle": {
+    "start": ["docker", "compose", "-f", "C:/ai/voice-oracle/compose.yml", "up", "-d"],
+    "stop":  ["docker", "compose", "-f", "C:/ai/voice-oracle/compose.yml", "down"],
+    "port": 8804,
+    "health_url": "http://127.0.0.1:8804/v1/models",
+    "gpu": true
+  }
+}
