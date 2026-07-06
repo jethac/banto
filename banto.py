@@ -18,6 +18,11 @@ HTTP API (default :7777):
                          "context": 32768, "kv_bits": 8}
                         -> fits? headroom? rough batch-1 decode tok/s (roofline:
                         bandwidth / active weight bytes). Estimates, clearly labeled.
+  GET  /artifacts       workstream artifact inventory: git repos under
+                        artifact_roots — branch, dirty files, UNPUSHED commits,
+                        workstream tag, at_risk list (machine-only work)
+  POST /archive         {"path": "/repo"} -> snapshot machine-only state to
+                        archive_dir: all-refs bundle + dirty.patch + untracked tar
   GET  /profiles        configured profiles
   POST /serve           {"profile": "name"}  -> 200 started | 208 already | 409 refused
   POST /stop            {"profile": "name"}  -> 200 stopped | 404
@@ -46,7 +51,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def load_json(path: Path, default):
@@ -292,6 +297,90 @@ def fit(req: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------- artifacts
+def _git(repo: str, *args) -> str:
+    try:
+        return subprocess.run(["git", "-C", repo] + list(args),
+                              capture_output=True, text=True, timeout=20).stdout.strip()
+    except Exception:
+        return ""
+
+
+def artifacts() -> dict:
+    """Workstream artifact inventory: git repos under artifact_roots with the
+    state that matters for recovery — branch, dirty files, UNPUSHED commits,
+    last activity, workstream tag. 'Where are the artifacts for X' should be a
+    query, not a memory."""
+    roots = [os.path.expanduser(r) for r in CFG.get("artifact_roots", [])]
+    ws_map = {os.path.expanduser(k): v for k, v in (CFG.get("workstreams") or {}).items()}
+    repos = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, _ in os.walk(root):
+            if dirpath.count(os.sep) - root.count(os.sep) > 2:
+                dirnames[:] = []
+                continue
+            if ".git" in dirnames or os.path.isfile(os.path.join(dirpath, ".git")):
+                dirnames[:] = []
+                dirty = _git(dirpath, "status", "--porcelain")
+                unpushed = _git(dirpath, "rev-list", "--count", "@{u}..HEAD") or "no-upstream"
+                repos.append({
+                    "path": dirpath,
+                    "workstream": next((v for k, v in sorted(ws_map.items(), key=lambda x: -len(x[0]))
+                                        if dirpath.startswith(k)), None),
+                    "branch": _git(dirpath, "rev-parse", "--abbrev-ref", "HEAD"),
+                    "dirty_files": len(dirty.splitlines()),
+                    "unpushed_commits": unpushed,
+                    "last_activity_days": round((time.time() - os.path.getmtime(dirpath)) / 86400, 1),
+                })
+    at_risk = [r["path"] for r in repos
+               if r["dirty_files"] or (str(r["unpushed_commits"]).isdigit() and int(r["unpushed_commits"]) > 0)]
+    return {"host": platform.node(), "roots": roots, "repos": repos,
+            "at_risk": at_risk,
+            "note": "at_risk = dirty or unpushed work that exists ONLY on this machine"}
+
+
+def archive_repo(req: dict) -> tuple[int, dict]:
+    """Snapshot a repo's machine-only state to the archive sink: bundle of all
+    local refs + dirty.patch + untracked tar (size-capped). Recovery beats
+    remembering."""
+    path = os.path.expanduser(req.get("path", ""))
+    roots = [os.path.expanduser(r) for r in CFG.get("artifact_roots", [])]
+    if not path or not any(path.startswith(r) for r in roots):
+        return 400, {"error": "path required and must be under artifact_roots"}
+    sink = os.path.expanduser(CFG.get("archive_dir", ""))
+    if not sink:
+        return 400, {"error": "archive_dir not configured"}
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dest = Path(sink) / platform.node().split(".")[0] / f"{Path(path).name}-{ts}"
+    dest.mkdir(parents=True, exist_ok=True)
+    out = {"dest": str(dest), "parts": []}
+    if subprocess.run(["git", "-C", path, "bundle", "create",
+                       str(dest / "all-refs.bundle"), "--all"],
+                      capture_output=True, timeout=300).returncode == 0:
+        out["parts"].append("all-refs.bundle")
+    diff = _git(path, "diff", "HEAD")
+    if diff:
+        (dest / "dirty.patch").write_text(diff)
+        out["parts"].append("dirty.patch")
+    untracked = [f for f in _git(path, "ls-files", "--others", "--exclude-standard").splitlines() if f]
+    if untracked:
+        big = [f for f in untracked
+               if os.path.getsize(os.path.join(path, f)) > 100 * 2**20
+               if os.path.exists(os.path.join(path, f))]
+        keep = [f for f in untracked if f not in big]
+        if keep:
+            subprocess.run(["tar", "czf", str(dest / "untracked.tar.gz"), "-C", path] + keep,
+                           capture_output=True, timeout=300)
+            out["parts"].append(f"untracked.tar.gz ({len(keep)} files)")
+        if big:
+            (dest / "SKIPPED-large-files.txt").write_text("\n".join(big))
+            out["parts"].append(f"SKIPPED {len(big)} files >100MB (listed)")
+    notify_registry("archive", {"path": path, "dest": str(dest)})
+    return 200, out
+
+
 # ---------------------------------------------------------------- processes
 def pid_file(name: str) -> Path:
     return STATE_DIR / f"{name}.pid"
@@ -416,6 +505,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, shape())
         elif self.path == "/usage":
             self._send(200, usage())
+        elif self.path == "/artifacts":
+            self._send(200, artifacts())
         elif self.path == "/profiles":
             self._send(200, {n: {k: v for k, v in p.items() if k != "stop"}
                              for n, p in profiles().items()})
@@ -432,6 +523,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad json"})
         if self.path == "/fit":
             return self._send(200, fit(req))
+        if self.path == "/archive":
+            return self._send(*archive_repo(req))
         name = req.get("profile", "")
         if self.path == "/serve":
             self._send(*start_profile(name))

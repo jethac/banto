@@ -4,5 +4,13 @@
   "token": "",
   "gpu_busy_util_pct": 15,
   "gpu_busy_vram_pct": 60,
-  "registry_cmd": ""
+  "registry_cmd": "",
+  "artifact_roots": [
+    "~/src",
+    "~/projects"
+  ],
+  "workstreams": {
+    "~/src/myproject": "my-workstream-slug"
+  },
+  "archive_dir": "/mnt/nas/artifact-archive"
 }
