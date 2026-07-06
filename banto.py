@@ -8,8 +8,12 @@ things up and down on request. Orchestrators ask; banto accepts or refuses.
 HTTP API (default :7777):
   GET  /health          host, OS, GPU utilization/VRAM, busy verdict, running profiles
   GET  /gpu             raw GPU snapshot
-  GET  /capability      what this box can run: memory envelope (unified or VRAM),
-                        est. memory bandwidth, live free memory, available engines
+  GET  /shape           the INVARIANT hardware shape (accelerator, envelope,
+                        bandwidth, engines) — detected once at startup, cached,
+                        keyed by shape_hash. Orchestrators: cache this per host.
+  GET  /usage           live state only (free/allocated memory, GPU util, busy
+                        verdict, running profiles) — cheap to poll.
+  GET  /capability      back-compat merged view: cached shape + live usage
   POST /fit             {"params_b": 120, "active_params_b": 12, "quant_bits": 4,
                          "context": 32768, "kv_bits": 8}
                         -> fits? headroom? rough batch-1 decode tok/s (roofline:
@@ -42,7 +46,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def load_json(path: Path, default):
@@ -175,35 +179,76 @@ def _bandwidth(accel_name: str) -> float:
     return 0.0
 
 
-def capability() -> dict:
+_SHAPE: dict = {}
+
+
+def shape() -> dict:
+    """The invariant hardware shape — detected ONCE at startup, then cached.
+
+    Orchestrators should cache this per-host (key on shape_hash) and poll only
+    /usage for live state. Restart banto to re-detect (hardware changed).
+    """
+    global _SHAPE
+    if _SHAPE:
+        return _SHAPE
     gpus = gpu_snapshot()
-    total_ram, free_ram = _mem_bytes()
+    total_ram, _ = _mem_bytes()
     if gpus:  # discrete NVIDIA: the envelope is VRAM
         g = gpus[0]
         envelope_gb = g["vram_total_mb"] / 1024
-        free_gb = (g["vram_total_mb"] - g["vram_used_mb"]) / 1024
         accel, unified = g["name"], False
     else:
         chip = _mac_chip() if platform.system() == "Darwin" else platform.processor() or platform.machine()
         accel, unified = chip, platform.system() == "Darwin"
         envelope_gb = total_ram / 1e9
-        free_gb = free_ram / 1e9
     usable_frac = float(CFG.get("usable_fraction", 0.75 if unified else 0.85))
     engines = [e for e in ("docker", "vllm", "llama-server", "ollama", "lms")
                if shutil.which(e)]
     for name, url in (CFG.get("engine_probes") or {}).items():
         if health_ok(url, 1.0):
             engines.append(name)
-    return {
+    _SHAPE = {
         "host": platform.node(), "os": platform.system(),
         "accelerator": accel, "unified_memory": unified,
-        "envelope_gb": round(envelope_gb, 1), "free_gb": round(free_gb, 1),
+        "envelope_gb": round(envelope_gb, 1),
         "usable_gb": round(envelope_gb * usable_frac, 1),
         "system_ram_total_gb": round(total_ram / 1e9, 1),
         "bandwidth_gbps_est": _bandwidth(accel),
         "engines": engines,
-        "note": "estimates; bandwidth from a lookup table unless overridden in config",
+        "detected_at": int(time.time()),
+        "note": "static shape — cache me; poll /usage for live state; restart banto after hardware changes",
     }
+    import hashlib
+    _SHAPE["shape_hash"] = hashlib.sha256(
+        json.dumps({k: v for k, v in _SHAPE.items() if k != "detected_at"},
+                   sort_keys=True).encode()).hexdigest()[:12]
+    return _SHAPE
+
+
+def usage() -> dict:
+    """Live state only — cheap to poll."""
+    gpus = gpu_snapshot()
+    _, free_ram = _mem_bytes()
+    s = shape()
+    if gpus:
+        g = gpus[0]
+        free_gb = (g["vram_total_mb"] - g["vram_used_mb"]) / 1024
+    else:
+        free_gb = free_ram / 1e9
+    busy, why = gpu_busy()
+    return {
+        "shape_hash": s["shape_hash"],
+        "free_gb": round(free_gb, 1),
+        "allocated_gb": round(max(s["envelope_gb"] - free_gb, 0), 1),
+        "gpus": gpus, "gpu_busy": busy, "gpu_busy_reason": why,
+        "profiles_running": [n for n in profiles() if running(n)],
+        "time": int(time.time()),
+    }
+
+
+def capability() -> dict:
+    """Back-compat merged view: cached shape + live usage."""
+    return {**shape(), **usage()}
 
 
 def fit(req: dict) -> dict:
@@ -213,7 +258,7 @@ def fit(req: dict) -> dict:
     1k tokens at fp16 (matches ~8B/GQA models), scaled by kv_bits/16. Decode
     tok/s roofline = bandwidth / bytes touched per token (active params for MoE).
     """
-    cap = capability()
+    cap = shape()
     params_b = float(req.get("params_b", 0))
     if params_b <= 0:
         return {"error": "params_b required (billions of parameters)"}
@@ -367,6 +412,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"gpus": gpu_snapshot()})
         elif self.path == "/capability":
             self._send(200, capability())
+        elif self.path == "/shape":
+            self._send(200, shape())
+        elif self.path == "/usage":
+            self._send(200, usage())
         elif self.path == "/profiles":
             self._send(200, {n: {k: v for k, v in p.items() if k != "stop"}
                              for n, p in profiles().items()})
@@ -397,9 +446,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    notify_registry("up", {"port": PORT})
-    print(f"banto {VERSION} on {BIND}:{PORT} — {platform.node()} ({platform.system()}), "
-          f"{len(profiles())} profile(s), guard: util>{BUSY_UTIL:.0f}% or vram>{BUSY_VRAM:.0f}%")
+    s = shape()  # detect the hardware shape once, up front
+    notify_registry("up", {"port": PORT, "shape_hash": s["shape_hash"]})
+    print(f"banto {VERSION} on {BIND}:{PORT} — {s['accelerator']}, "
+          f"{s['usable_gb']}GB usable @ ~{s['bandwidth_gbps_est']:.0f}GB/s "
+          f"[{s['shape_hash']}], {len(profiles())} profile(s), "
+          f"guard: util>{BUSY_UTIL:.0f}% or vram>{BUSY_VRAM:.0f}%")
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
 
 
