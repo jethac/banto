@@ -60,7 +60,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 
 def load_json(path: Path, default):
@@ -81,6 +81,11 @@ UPDATE_REPO = CFG.get("update_repo", "jethac/banto")   # owner/repo to pull rele
 AUTO_UPDATE = bool(CFG.get("auto_update", False))      # apply updates automatically when found
 UPDATE_INTERVAL_H = float(CFG.get("update_check_interval_hours", 24))  # 0 disables the check
 
+# Windows: banto is a background daemon, so every helper command it shells out to
+# (nvidia-smi, tasklist, taskkill, git…) must NOT flash a console window.
+# CREATE_NO_WINDOW does that; it's an ignored no-op kwarg on macOS/Linux.
+_NO_WINDOW = {"creationflags": 0x08000000} if platform.system() == "Windows" else {}
+
 
 def profiles() -> dict:
     return load_json(CONFIG_DIR / "profiles.json", {})
@@ -98,7 +103,7 @@ def gpu_snapshot() -> list[dict]:
         out = subprocess.run(
             [smi, "--query-gpu=name,utilization.gpu,memory.used,memory.total",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, **_NO_WINDOW,
         ).stdout.strip()
         gpus = []
         for line in out.splitlines():
@@ -175,13 +180,19 @@ def _mem_bytes() -> tuple[int, int]:
             kv = {l.split(":")[0]: int(l.split()[1]) for l in info.splitlines() if ":" in l}
             return kv.get("MemTotal", 0) * 1024, kv.get("MemAvailable", 0) * 1024
         if system == "Windows":
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "(Get-CimInstance Win32_OperatingSystem | "
-                 "Select-Object TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json)"],
-                capture_output=True, text=True, timeout=10).stdout
-            d = json.loads(out)
-            return int(d["TotalVisibleMemorySize"]) * 1024, int(d["FreePhysicalMemory"]) * 1024
+            # Win32 GlobalMemoryStatusEx — no subprocess, no flashing window.
+            import ctypes
+
+            class _MEMEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = _MEMEX()
+            m.dwLength = ctypes.sizeof(m)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return int(m.ullTotalPhys), int(m.ullAvailPhys)
     except Exception:
         pass
     return 0, 0
@@ -313,7 +324,7 @@ def fit(req: dict) -> dict:
 def _git(repo: str, *args) -> str:
     try:
         return subprocess.run(["git", "-C", repo] + list(args),
-                              capture_output=True, text=True, timeout=20).stdout.strip()
+                              capture_output=True, text=True, timeout=20, **_NO_WINDOW).stdout.strip()
     except Exception:
         return ""
 
@@ -370,7 +381,7 @@ def archive_repo(req: dict) -> tuple[int, dict]:
     out = {"dest": str(dest), "parts": []}
     if subprocess.run(["git", "-C", path, "bundle", "create",
                        str(dest / "all-refs.bundle"), "--all"],
-                      capture_output=True, timeout=300).returncode == 0:
+                      capture_output=True, timeout=300, **_NO_WINDOW).returncode == 0:
         out["parts"].append("all-refs.bundle")
     diff = _git(path, "diff", "HEAD")
     if diff:
@@ -384,7 +395,7 @@ def archive_repo(req: dict) -> tuple[int, dict]:
         keep = [f for f in untracked if f not in big]
         if keep:
             subprocess.run(["tar", "czf", str(dest / "untracked.tar.gz"), "-C", path] + keep,
-                           capture_output=True, timeout=300)
+                           capture_output=True, timeout=300, **_NO_WINDOW)
             out["parts"].append(f"untracked.tar.gz ({len(keep)} files)")
         if big:
             (dest / "SKIPPED-large-files.txt").write_text("\n".join(big))
@@ -406,7 +417,7 @@ def running(name: str) -> bool:
         pid = int(pf.read_text().strip())
         if platform.system() == "Windows":
             out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
-                                 capture_output=True, text=True, timeout=5).stdout
+                                 capture_output=True, text=True, timeout=5, **_NO_WINDOW).stdout
             return str(pid) in out
         os.kill(pid, 0)
         return True
@@ -428,7 +439,7 @@ def notify_registry(event: str, detail: dict):
     try:
         payload = json.dumps({"event": event, "host": platform.node(), **detail})
         cmd = REGISTRY_CMD.replace("{event}", payload.replace("'", ""))
-        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_NO_WINDOW)
     except Exception:
         pass
 
@@ -448,7 +459,8 @@ def start_profile(name: str) -> tuple[int, dict]:
     start = prof["start"]
     kwargs: dict = {"stdout": log, "stderr": log}
     if platform.system() == "Windows":
-        kwargs["creationflags"] = 0x00000208  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        kwargs["creationflags"] = 0x00000208 | 0x08000000
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(start if isinstance(start, list) else shlex.split(start),
@@ -467,13 +479,13 @@ def stop_profile(name: str) -> tuple[int, dict]:
     stop = prof.get("stop")
     if stop:
         subprocess.run(stop if isinstance(stop, list) else shlex.split(stop),
-                       timeout=60, capture_output=True)
+                       timeout=60, capture_output=True, **_NO_WINDOW)
     elif pid_file(name).exists():
         try:
             pid = int(pid_file(name).read_text().strip())
             if platform.system() == "Windows":
                 subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                               capture_output=True, timeout=15)
+                               capture_output=True, timeout=15, **_NO_WINDOW)
             else:
                 os.killpg(os.getpgid(pid), signal.SIGTERM)
         except Exception:

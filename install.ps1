@@ -41,11 +41,23 @@ if (-not (Test-Path $cfgpath)) {
   Say "wrote $cfgpath"
 } else { Say "config exists - leaving it" }
 
-# --- scheduled task (runs at logon as you; use NSSM for no-login headless)
+# --- scheduled task (pythonw = no console window; runs at logon as you).
+# For a true no-login headless service use NSSM (AppExit Default Restart) - see
+# service/WINDOWS.md; that also makes self-update's restart reliable on Windows.
 $action  = "`"$py`" `"$dir\banto.py`""
 schtasks /Create /TN banto /SC ONLOGON /RU $env:USERNAME /TR $action /F | Out-Null
 schtasks /Run /TN banto | Out-Null
 Say "scheduled task 'banto' installed + started"
+
+# --- open the inbound port so the fleet can reach it (needs an elevated shell)
+try {
+  if (-not (Get-NetFirewallRule -DisplayName "banto" -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -DisplayName "banto" -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null
+  }
+  Say "firewall: inbound TCP :$port allowed"
+} catch {
+  Say "could NOT open firewall :$port - re-run this in an Administrator PowerShell to allow it."
+}
 
 # --- verify
 Start-Sleep -Seconds 3
