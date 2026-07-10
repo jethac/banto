@@ -38,10 +38,11 @@ command -v curl >/dev/null 2>&1 || die "curl not found."
 # --- 2. download banto (latest release)
 mkdir -p "$DIR"
 BASE="https://github.com/$REPO/releases/latest/download"
-say "downloading banto from $REPO (latest release)…"
+say "downloading latest banto from $REPO…"
 curl -fsSL -o "$DIR/banto.py" "$BASE/banto.py" || die "could not download banto.py"
 curl -fsSL -o "$DIR/banto_lb.py" "$BASE/banto_lb.py" 2>/dev/null || true
-VER="$("$PY" "$DIR/banto.py" --version 2>/dev/null || echo '?')"
+VER="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$DIR/banto.py" | head -1)"
+say "got banto ${VER:-?}"
 
 # --- 3. config (never clobber an existing one)
 mkdir -p "$CFGDIR"

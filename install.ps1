@@ -25,10 +25,14 @@ if (-not $py) { throw "Python 3.10+ not found. Run: winget install Python.Python
 # --- download
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $base = "https://github.com/$repo/releases/latest/download"
-Say "downloading banto from $repo (latest release)..."
+Say "downloading latest banto from $repo..."
 curl.exe -fsSL -o "$dir\banto.py" "$base/banto.py"
 if ($LASTEXITCODE -ne 0) { throw "could not download banto.py" }
 curl.exe -fsSL -o "$dir\banto_lb.py" "$base/banto_lb.py" 2>$null
+# read the version straight from the file (pythonw has no stdout to query)
+$verMatch = Select-String -Path "$dir\banto.py" -Pattern '^VERSION = "([^"]+)"' | Select-Object -First 1
+$ver = if ($verMatch) { $verMatch.Matches[0].Groups[1].Value } else { "?" }
+Say "got banto $ver"
 
 # --- config (never clobber an existing one)
 New-Item -ItemType Directory -Force -Path $cfgdir | Out-Null
