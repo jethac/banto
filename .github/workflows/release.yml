@@ -1,0 +1,36 @@
+name: release
+
+# Tag a commit `vX.Y.Z` (matching VERSION in banto.py + pyproject.toml) and push
+# the tag. This builds a GitHub Release with the banto sources + SHA256SUMS as
+# assets — which is exactly what banto's own self-update pulls from.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - name: tag must match VERSION and pyproject
+        run: python .github/scripts/check_version.py "${GITHUB_REF_NAME#v}"
+      - name: compile
+        run: python -m py_compile banto.py banto_lb.py
+      - name: checksums (self-update verifies against these)
+        run: sha256sum banto.py banto_lb.py config.example.json profiles.example.json > SHA256SUMS
+      - name: publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          generate_release_notes: true
+          files: |
+            banto.py
+            banto_lb.py
+            config.example.json
+            profiles.example.json
+            SHA256SUMS

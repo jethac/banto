@@ -26,7 +26,15 @@ HTTP API (default :7777):
   GET  /profiles        configured profiles
   POST /serve           {"profile": "name"}  -> 200 started | 208 already | 409 refused
   POST /stop            {"profile": "name"}  -> 200 stopped | 404
+  GET  /update           self-update status: current vs latest GitHub release
+  POST /update          {"apply": true} -> pull, verify, replace, restart in place
 Optional auth: send  X-Banto-Token: <token>  when a token is configured.
+
+CLI:  banto.py --version | --check-update | --self-update
+Self-update pulls the newest release from update_repo (default jethac/banto),
+applies only strictly-newer versions, compile-checks + checksum-verifies before
+an atomic swap (keeps <banto>.bak), and restarts in place. auto_update:true in
+config applies automatically; update_check_interval_hours:0 disables it.
 
 Config:   ~/.config/banto/config.json    (see config.example.json)
 Profiles: ~/.config/banto/profiles.json  (see profiles.example.json)
@@ -44,6 +52,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,7 +60,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def load_json(path: Path, default):
@@ -68,6 +77,9 @@ TOKEN = CFG.get("token", "")
 BUSY_UTIL = float(CFG.get("gpu_busy_util_pct", 15))
 BUSY_VRAM = float(CFG.get("gpu_busy_vram_pct", 60))
 REGISTRY_CMD = CFG.get("registry_cmd", "")  # e.g. "agentbus send banto '*' '{event}'"
+UPDATE_REPO = CFG.get("update_repo", "jethac/banto")   # owner/repo to pull releases from
+AUTO_UPDATE = bool(CFG.get("auto_update", False))      # apply updates automatically when found
+UPDATE_INTERVAL_H = float(CFG.get("update_check_interval_hours", 24))  # 0 disables the check
 
 
 def profiles() -> dict:
@@ -471,6 +483,166 @@ def stop_profile(name: str) -> tuple[int, dict]:
     return 200, {"status": "stopped", "profile": name}
 
 
+# ---------------------------------------------------------------- self-update
+# banto watches its own GitHub releases and can replace itself in place. Pure
+# stdlib. Only strictly-NEWER versions are applied; the download is compile-
+# checked (and checksum-verified when the release ships SHA256SUMS) before the
+# swap; the previous file is kept as <banto>.bak. Restart is an in-place
+# os.execv so the supervisor (launchd/systemd) sees the same PID and treats it
+# as still-alive — no crash, no flap.
+def _ver_tuple(v: str) -> tuple:
+    out = []
+    for part in str(v).strip().lstrip("vV").split("."):
+        digits = "".join(c for c in part if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+def _gh_api(path: str):
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{UPDATE_REPO}{path}",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"banto/{VERSION}"})
+    tok = CFG.get("github_token") or os.environ.get("GITHUB_TOKEN")
+    if tok:
+        req.add_header("Authorization", f"Bearer {tok}")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
+def _asset_preference() -> list:
+    """Release-asset names to try, most platform-specific first, portable .py last.
+    banto is pure Python today so the universal banto.py wins on every host, but
+    the order lets a future compiled build (banto-darwin-arm64, ...) take over
+    per platform without changing this code."""
+    osname = platform.system().lower()               # darwin / linux / windows
+    arch = platform.machine().lower()                # arm64 / x86_64 / amd64
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch, arch)
+    return [f"banto-{osname}-{arch}", f"banto-{osname}-{arch}.py",
+            f"banto-{osname}", "banto.py"]
+
+
+def check_update() -> dict:
+    """Compare our VERSION to the latest GitHub release. Never raises."""
+    try:
+        rel = _gh_api("/releases/latest")
+    except Exception as e:
+        return {"current": VERSION, "repo": UPDATE_REPO, "error": f"{type(e).__name__}: {e}"}
+    tag = rel.get("tag_name", "")
+    assets = rel.get("assets", [])
+    available = bool(tag) and _ver_tuple(tag) > _ver_tuple(VERSION)
+    chosen = None
+    if available:
+        by_name = {a.get("name"): a for a in assets}
+        chosen = next((by_name[n] for n in _asset_preference() if n in by_name), None)
+    return {
+        "current": VERSION, "latest": tag, "repo": UPDATE_REPO,
+        "update_available": available, "published_at": rel.get("published_at"),
+        "asset": chosen.get("name") if chosen else None,
+        "_asset_url": chosen.get("browser_download_url") if chosen else None,
+        "_assets": assets,
+    }
+
+
+def update_status() -> dict:
+    """Public view of check_update() (private _fields stripped)."""
+    return {k: v for k, v in check_update().items() if not k.startswith("_")}
+
+
+def _download(url: str) -> bytes:
+    req = urllib.request.Request(
+        url, headers={"User-Agent": f"banto/{VERSION}", "Accept": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.read()
+
+
+def _checksum_ok(data: bytes, assets: list, asset_name: str) -> tuple:
+    """Verify against the release's SHA256SUMS asset if present. Corruption/partial
+    -download guard — NOT a substitute for signing (a compromised release could
+    ship matching sums). Returns (ok, why)."""
+    sums = next((a for a in assets if a.get("name", "").upper().startswith("SHA256")), None)
+    if not sums:
+        return True, "no SHA256SUMS in release (integrity not verified)"
+    import hashlib
+    try:
+        text = _download(sums["browser_download_url"]).decode()
+    except Exception as e:
+        return False, f"could not fetch SHA256SUMS: {e}"
+    want = next((ln.split()[0].lower() for ln in text.splitlines()
+                 if len(ln.split()) >= 2 and ln.split()[1].lstrip("*") == asset_name), None)
+    if not want:
+        return True, f"{asset_name} not listed in SHA256SUMS"
+    got = hashlib.sha256(data).hexdigest().lower()
+    return got == want, f"want {want[:12]} got {got[:12]}"
+
+
+def self_update(apply: bool = True, restart: bool = True) -> tuple:
+    """Pull + apply a newer release. Returns (http_code, dict)."""
+    info = check_update()
+    if info.get("error"):
+        return 502, {"status": "check-failed", "current": VERSION, "error": info["error"]}
+    if not info.get("update_available"):
+        return 200, {"status": "up-to-date", "current": VERSION, "latest": info.get("latest")}
+    if not info.get("_asset_url"):
+        return 404, {"status": "no-asset-for-platform", "current": VERSION,
+                     "latest": info.get("latest"),
+                     "hint": "release has no asset matching this platform"}
+    if not info["asset"].endswith(".py"):
+        return 501, {"status": "binary-swap-unsupported", "asset": info["asset"],
+                     "hint": "this release ships a non-.py artifact; swap it via your installer"}
+    if not apply:
+        return 200, {"status": "update-available", "current": VERSION,
+                     "latest": info["latest"], "asset": info["asset"]}
+    try:
+        data = _download(info["_asset_url"])
+    except Exception as e:
+        return 502, {"status": "download-failed", "error": str(e)}
+    ok, why = _checksum_ok(data, info["_assets"], info["asset"])
+    if not ok:
+        return 502, {"status": "checksum-failed", "detail": why}
+    target = Path(os.path.realpath(__file__))
+    tmp = target.with_name(target.name + ".new")
+    tmp.write_bytes(data)
+    import py_compile
+    try:
+        py_compile.compile(str(tmp), doraise=True)          # never swap in broken code
+    except py_compile.PyCompileError as e:
+        tmp.unlink(missing_ok=True)
+        return 500, {"status": "download-does-not-compile", "detail": str(e)}
+    shutil.copy2(target, target.with_name(target.name + ".bak"))
+    os.replace(tmp, target)                                  # atomic
+    notify_registry("updated", {"from": VERSION, "to": info["latest"]})
+    sys.stderr.write(f"[banto] updated {VERSION} -> {info['latest']} ({why})\n")
+    if restart:
+        threading.Thread(target=_restart_soon, daemon=True).start()
+    return 200, {"status": "updating" if restart else "updated-on-disk",
+                 "from": VERSION, "to": info["latest"], "checksum": why,
+                 "note": ("restarting in place into the new version" if restart
+                          else "file replaced; restart the banto service to activate")}
+
+
+def _restart_soon():
+    time.sleep(0.4)  # let the triggering HTTP response flush first
+    os.execv(sys.executable, [sys.executable, os.path.realpath(__file__)] + sys.argv[1:])
+
+
+def _update_loop():
+    delay = 45.0  # first check shortly after boot, then every UPDATE_INTERVAL_H
+    while True:
+        time.sleep(delay)
+        delay = max(UPDATE_INTERVAL_H, 0.1) * 3600
+        try:
+            info = check_update()
+            if info.get("update_available"):
+                sys.stderr.write(f"[banto] update available: {VERSION} -> {info.get('latest')}"
+                                 + (" (auto-applying)" if AUTO_UPDATE else "") + "\n")
+                notify_registry("update-available",
+                                {"current": VERSION, "latest": info.get("latest")})
+                if AUTO_UPDATE:
+                    self_update(apply=True)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- HTTP server
 class Handler(BaseHTTPRequestHandler):
     server_version = f"banto/{VERSION}"
@@ -510,6 +682,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/profiles":
             self._send(200, {n: {k: v for k, v in p.items() if k != "stop"}
                              for n, p in profiles().items()})
+        elif self.path == "/update":
+            self._send(200, update_status())
         else:
             self._send(404, {"error": "unknown path"})
 
@@ -525,6 +699,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, fit(req))
         if self.path == "/archive":
             return self._send(*archive_repo(req))
+        if self.path == "/update":
+            return self._send(*self_update(apply=bool(req.get("apply", True))))
         name = req.get("profile", "")
         if self.path == "/serve":
             self._send(*start_profile(name))
@@ -544,9 +720,24 @@ def main():
     print(f"banto {VERSION} on {BIND}:{PORT} — {s['accelerator']}, "
           f"{s['usable_gb']}GB usable @ ~{s['bandwidth_gbps_est']:.0f}GB/s "
           f"[{s['shape_hash']}], {len(profiles())} profile(s), "
-          f"guard: util>{BUSY_UTIL:.0f}% or vram>{BUSY_VRAM:.0f}%")
+          f"guard: util>{BUSY_UTIL:.0f}% or vram>{BUSY_VRAM:.0f}%, "
+          f"updates: {'auto' if AUTO_UPDATE else 'check-only'} from {UPDATE_REPO}"
+          if UPDATE_INTERVAL_H > 0 else "updates: off")
+    if UPDATE_INTERVAL_H > 0:
+        threading.Thread(target=_update_loop, daemon=True).start()
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd in ("--version", "-V", "version"):
+            print(VERSION); sys.exit(0)
+        if cmd in ("--check-update", "check-update"):
+            print(json.dumps(update_status(), indent=1)); sys.exit(0)
+        if cmd in ("--self-update", "self-update"):
+            # CLI is a one-shot: replace the file on disk, don't exec (the daemon
+            # is a separate process — restart the banto service to activate).
+            code, res = self_update(apply=True, restart=False)
+            print(json.dumps(res, indent=1)); sys.exit(0 if code == 200 else 1)
     main()

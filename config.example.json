@@ -5,6 +5,10 @@
   "gpu_busy_util_pct": 15,
   "gpu_busy_vram_pct": 60,
   "registry_cmd": "",
+  "update_repo": "jethac/banto",
+  "auto_update": false,
+  "update_check_interval_hours": 24,
+  "github_token": "",
   "artifact_roots": [
     "~/src",
     "~/projects"
