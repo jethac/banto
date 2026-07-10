@@ -25,6 +25,30 @@ No database. No queue. No sidecar. Two files.
 
 ## Install
 
+One line, per box. **macOS / Linux:**
+
+```bash
+curl -fsSL https://github.com/jethac/banto/releases/latest/download/install.sh | sh
+```
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://github.com/jethac/banto/releases/latest/download/install.ps1 | iex
+```
+
+That downloads the latest release, writes a default config (auto-update **on**), installs + starts the service (launchd / systemd / Task Scheduler), and verifies. Idempotent — re-run any time. After this the box self-updates; you never touch it by hand again. Only prereq is Python 3.10+.
+
+Give the fleet a shared auth token, or tweak the listen address, in the same line:
+
+```bash
+BANTO_TOKEN=your-fleet-token curl -fsSL https://github.com/jethac/banto/releases/latest/download/install.sh | sh
+```
+
+Other env knobs: `BANTO_BIND` (default `0.0.0.0`), `BANTO_PORT`, `BANTO_DIR`, `BANTO_NO_AUTOUPDATE=1` (check-only). Serving models on this box? Drop a `profiles.json` beside the config (copy `profiles.example.json`, edit `start`/`stop`/`port`).
+
+<details><summary>Manual install / hacking on it</summary>
+
 ```bash
 git clone https://github.com/jethac/banto && cd banto
 mkdir -p ~/.config/banto
@@ -33,7 +57,8 @@ cp profiles.example.json ~/.config/banto/profiles.json   # edit for this machine
 python3 banto.py
 ```
 
-Run it as a service: `service/` has a launchd plist (macOS), a systemd unit (Linux), and Windows instructions (Task Scheduler / NSSM).
+Service templates live in `service/` (launchd plist, systemd unit, Windows notes / NSSM).
+</details>
 
 For the failover proxy: `cp lb.example.json ~/.config/banto/lb.json`, edit backends, `python3 banto_lb.py`.
 

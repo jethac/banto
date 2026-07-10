@@ -23,7 +23,7 @@ jobs:
       - name: compile
         run: python -m py_compile banto.py banto_lb.py
       - name: checksums (self-update verifies against these)
-        run: sha256sum banto.py banto_lb.py config.example.json profiles.example.json > SHA256SUMS
+        run: sha256sum banto.py banto_lb.py install.sh install.ps1 config.example.json profiles.example.json > SHA256SUMS
       - name: publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
@@ -31,6 +31,8 @@ jobs:
           files: |
             banto.py
             banto_lb.py
+            install.sh
+            install.ps1
             config.example.json
             profiles.example.json
             SHA256SUMS
