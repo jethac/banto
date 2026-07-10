@@ -58,9 +58,30 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+
+def _safe_streams() -> None:
+    """Never let a log line crash the daemon. Under pythonw stdout/stderr are
+    None; under a legacy Windows codepage (cp932 etc.) they can't encode the
+    daemon's output. Redirect None to devnull and force UTF-8 on the rest."""
+    for _name in ("stdout", "stderr"):
+        _s = getattr(sys, _name, None)
+        if _s is None:
+            try:
+                setattr(sys, _name, open(os.devnull, "w"))
+            except Exception:
+                pass
+        else:
+            try:
+                _s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_safe_streams()
+
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.5.5"
+VERSION = "0.5.6"
 
 
 def load_json(path: Path, default):
@@ -733,12 +754,16 @@ def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     s = shape()  # detect the hardware shape once, up front
     notify_registry("up", {"port": PORT, "shape_hash": s["shape_hash"]})
-    print(f"banto {VERSION} on {BIND}:{PORT} — {s['accelerator']}, "
-          f"{s['usable_gb']}GB usable @ ~{s['bandwidth_gbps_est']:.0f}GB/s "
-          f"[{s['shape_hash']}], {len(profiles())} profile(s), "
-          f"guard: util>{BUSY_UTIL:.0f}% or vram>{BUSY_VRAM:.0f}%, "
-          f"updates: {'auto' if AUTO_UPDATE else 'check-only'} from {UPDATE_REPO}"
-          if UPDATE_INTERVAL_H > 0 else "updates: off")
+    banner = (f"banto {VERSION} on {BIND}:{PORT} - {s['accelerator']}, "
+              f"{s['usable_gb']}GB usable @ ~{s['bandwidth_gbps_est']:.0f}GB/s "
+              f"[{s['shape_hash']}], {len(profiles())} profile(s), "
+              f"guard: util>{BUSY_UTIL:.0f}% or vram>{BUSY_VRAM:.0f}%, "
+              f"updates: {'auto' if AUTO_UPDATE else 'check-only'} from {UPDATE_REPO}"
+              if UPDATE_INTERVAL_H > 0 else "updates: off")
+    try:
+        print(banner)
+    except Exception:
+        pass  # banner is optional — never let it stop the server from starting
     if UPDATE_INTERVAL_H > 0:
         threading.Thread(target=_update_loop, daemon=True).start()
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
