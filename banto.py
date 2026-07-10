@@ -60,7 +60,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 
 def load_json(path: Path, default):
@@ -544,8 +544,12 @@ def check_update() -> dict:
 
 
 def update_status() -> dict:
-    """Public view of check_update() (private _fields stripped)."""
-    return {k: v for k, v in check_update().items() if not k.startswith("_")}
+    """Public view of check_update() (private _fields stripped) + this box's policy,
+    so `GET /update` shows both 'is there a newer release' and 'will I apply it'."""
+    out = {k: v for k, v in check_update().items() if not k.startswith("_")}
+    out["auto_update"] = AUTO_UPDATE
+    out["check_interval_hours"] = UPDATE_INTERVAL_H
+    return out
 
 
 def _download(url: str) -> bytes:
