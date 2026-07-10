@@ -60,7 +60,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 
 
 def load_json(path: Path, default):
