@@ -81,7 +81,7 @@ _safe_streams()
 
 CONFIG_DIR = Path(os.environ.get("BANTO_CONFIG_DIR", Path.home() / ".config" / "banto"))
 STATE_DIR = Path(os.environ.get("BANTO_STATE_DIR", Path.home() / ".local" / "state" / "banto"))
-VERSION = "0.5.6"
+VERSION = "0.5.7"
 
 
 def load_json(path: Path, default):
