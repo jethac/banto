@@ -113,8 +113,25 @@ def profiles() -> dict:
 
 
 # ---------------------------------------------------------------- GPU snapshot
-def gpu_snapshot() -> list[dict]:
-    """NVIDIA GPUs via nvidia-smi (Linux/Windows). Empty list when none/unknown."""
+def _parse_float(s: str) -> float | None:
+    """nvidia-smi (and friends) report unsupported metrics as the literal
+    string '[N/A]' rather than omitting the field -- most notably on unified-
+    memory superchips (GB10 Grace Blackwell and similar) which have no
+    discrete VRAM counter for the driver to report at all. That's a real
+    signal (this GPU IS unified-memory), not a parse error to swallow.
+    """
+    s = s.strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _nvidia_gpu_snapshot() -> list[dict]:
+    """NVIDIA GPUs via nvidia-smi. Each numeric field is parsed independently
+    -- one unsupported metric (e.g. memory.* on a unified-memory chip) must
+    never take the whole GPU entry down with it via a bare except.
+    """
     smi = shutil.which("nvidia-smi") or (
         r"C:\Windows\System32\nvidia-smi.exe" if platform.system() == "Windows" else None
     )
@@ -126,28 +143,134 @@ def gpu_snapshot() -> list[dict]:
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5, **_NO_WINDOW,
         ).stdout.strip()
-        gpus = []
-        for line in out.splitlines():
-            name, util, used, total = [p.strip() for p in line.split(",")]
-            gpus.append({
-                "name": name,
-                "util_pct": float(util),
-                "vram_used_mb": float(used),
-                "vram_total_mb": float(total),
-                "vram_pct": round(100.0 * float(used) / max(float(total), 1), 1),
-            })
-        return gpus
     except Exception:
         return []
 
+    gpus = []
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            continue
+        name, util_s, used_s, total_s = parts
+        util = _parse_float(util_s)
+        used = _parse_float(used_s)
+        total = _parse_float(total_s)
+        # Both memory fields unparseable on a real NVIDIA GPU line == no
+        # discrete VRAM counter exists at all, i.e. this chip IS unified
+        # memory (Grace Blackwell/GB10 and similar) -- not a broken reading.
+        unified = used is None and total is None
+        gpus.append({
+            "name": name,
+            "vendor": "nvidia",
+            "unified_memory": unified,
+            "util_pct": util,
+            "vram_used_mb": used,
+            "vram_total_mb": total,
+            "vram_pct": (round(100.0 * used / max(total, 1), 1)
+                         if used is not None and total is not None else None),
+        })
+    return gpus
+
+
+def _read_sysfs(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def _amd_gpu_name(device_dir: Path) -> str | None:
+    """product_name is blank on plenty of real cards (confirmed on a Vega 10
+    Radeon PRO WX 8100) -- fall back to resolving the PCI bus address via
+    lspci, which reliably has the marketing name even when the driver's own
+    sysfs string doesn't.
+    """
+    name = _read_sysfs(device_dir / "product_name")
+    if name:
+        return name
+    lspci = shutil.which("lspci")
+    if not lspci:
+        return None
+    try:
+        bdf = device_dir.resolve().name  # e.g. "0000:b5:00.0"
+        short_bdf = bdf.split(":", 1)[1] if bdf.count(":") > 1 else bdf
+        out = subprocess.run([lspci, "-s", short_bdf], capture_output=True, text=True, timeout=3).stdout
+        line = out.strip().splitlines()[0] if out.strip() else ""
+        # "b5:00.0 VGA compatible controller: ... [Radeon PRO WX 8100/8200]" -> the bracketed part
+        if "[" in line and line.rstrip().endswith("]"):
+            return line[line.rindex("[") + 1:-1]
+        return line.split(": ", 1)[1] if ": " in line else None
+    except Exception:
+        return None
+
+
+def _amd_gpu_snapshot() -> list[dict]:
+    """AMD GPUs via the amdgpu kernel driver's own sysfs attributes --
+    deliberately not rocm-smi/amd-smi, since gaming-class AMD cards (e.g. a
+    repurposed Stadia box) very often don't have the ROCm userspace stack
+    installed at all, but the kernel driver's sysfs files are there
+    whenever an amdgpu card is present and bound.
+    """
+    drm_root = Path("/sys/class/drm")
+    if not drm_root.exists():
+        return []
+    gpus = []
+    for card_dir in sorted(drm_root.glob("card[0-9]*")):
+        device_dir = card_dir / "device"
+        vendor = _read_sysfs(device_dir / "vendor")
+        if vendor is None or vendor.lower() != "0x1002":  # AMD PCI vendor ID
+            continue
+        name = (_amd_gpu_name(device_dir)
+                 or _read_sysfs(device_dir / "device")
+                 or f"AMD GPU ({card_dir.name})")
+        used_b = _read_sysfs(device_dir / "mem_info_vram_used")
+        total_b = _read_sysfs(device_dir / "mem_info_vram_total")
+        util_s = _read_sysfs(device_dir / "gpu_busy_percent")
+        # mem_info_vram_* are raw bytes; convert to MiB (2**20) to match
+        # nvidia-smi's own memory.total/memory.used convention (--nounits
+        # reports MiB, not decimal MB) -- envelope_gb math downstream (/1024)
+        # assumes this unit consistently across vendors.
+        used = float(used_b) / 1048576 if used_b and used_b.isdigit() else None
+        total = float(total_b) / 1048576 if total_b and total_b.isdigit() else None
+        util = float(util_s) if util_s and util_s.replace(".", "", 1).isdigit() else None
+        gpus.append({
+            "name": name,
+            "vendor": "amd",
+            "unified_memory": False,  # discrete cards; revisit if/when an AMD APU matters here
+            "util_pct": util,
+            "vram_used_mb": used,
+            "vram_total_mb": total,
+            "vram_pct": (round(100.0 * used / max(total, 1), 1)
+                         if used is not None and total is not None else None),
+        })
+    return gpus
+
+
+def gpu_snapshot() -> list[dict]:
+    """All GPUs banto knows how to introspect (NVIDIA, AMD). Empty list when
+    none present or recognized -- never raises.
+    """
+    try:
+        nvidia = _nvidia_gpu_snapshot()
+    except Exception:
+        nvidia = []
+    try:
+        amd = _amd_gpu_snapshot()
+    except Exception:
+        amd = []
+    return nvidia + amd
+
 
 def gpu_busy() -> tuple[bool, str]:
-    """The gaming guard: is someone (probably the owner) using the GPU?"""
+    """The gaming guard: is someone (probably the owner) using the GPU?
+    Fields banto couldn't measure (None) are skipped, not treated as 0 or as
+    a crash -- an unmeasurable axis proves nothing either way.
+    """
     gpus = gpu_snapshot()
     for g in gpus:
-        if g["util_pct"] >= BUSY_UTIL:
+        if g["util_pct"] is not None and g["util_pct"] >= BUSY_UTIL:
             return True, f"{g['name']} at {g['util_pct']:.0f}% util (threshold {BUSY_UTIL:.0f}%)"
-        if g["vram_pct"] >= BUSY_VRAM:
+        if g["vram_pct"] is not None and g["vram_pct"] >= BUSY_VRAM:
             return True, f"{g['name']} VRAM {g['vram_pct']:.0f}% used (threshold {BUSY_VRAM:.0f}%)"
     return False, ""
 
@@ -242,10 +365,20 @@ def shape() -> dict:
         return _SHAPE
     gpus = gpu_snapshot()
     total_ram, _ = _mem_bytes()
-    if gpus:  # discrete NVIDIA: the envelope is VRAM
+    if gpus and gpus[0].get("vram_total_mb") is not None:
+        # A GPU with a real discrete VRAM reading: the envelope is VRAM.
         g = gpus[0]
         envelope_gb = g["vram_total_mb"] / 1024
-        accel, unified = g["name"], False
+        accel, unified = g["name"], g.get("unified_memory", False)
+    elif gpus:
+        # A GPU IS present (name resolved fine) but has no discrete VRAM
+        # counter to report -- e.g. GB10 Grace Blackwell and similar unified-
+        # memory superchips. The envelope is the shared system RAM pool, and
+        # the GPU's own unified_memory flag (set in gpu_snapshot()) already
+        # says why, rather than this being an OS-specific guess.
+        g = gpus[0]
+        accel, unified = g["name"], g.get("unified_memory", True)
+        envelope_gb = total_ram / 1e9
     else:
         chip = _mac_chip() if platform.system() == "Darwin" else platform.processor() or platform.machine()
         accel, unified = chip, platform.system() == "Darwin"
@@ -279,10 +412,12 @@ def usage() -> dict:
     gpus = gpu_snapshot()
     _, free_ram = _mem_bytes()
     s = shape()
-    if gpus:
+    if gpus and gpus[0].get("vram_total_mb") is not None and gpus[0].get("vram_used_mb") is not None:
         g = gpus[0]
         free_gb = (g["vram_total_mb"] - g["vram_used_mb"]) / 1024
     else:
+        # No discrete VRAM reading (unified memory, or no GPU at all) --
+        # system free RAM is the real live-headroom signal instead.
         free_gb = free_ram / 1e9
     busy, why = gpu_busy()
     return {
